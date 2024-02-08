@@ -1,5 +1,7 @@
 import hashlib
-import sqlite3
+#import sqlite3###
+from google.cloud import bigquery as bq
+from google.oauth2 import service_account as sa
 
 class user():
     def __init__(self) -> None:
@@ -7,9 +9,9 @@ class user():
         self.password: str = None
         self._admin: bool = False
 
-        self.db = sqlite3.connect("user_data.db")
-        self.cursor = self.db.cursor()
-        #self.cursor.row_factory = sqlite3.Row
+        self.credentials = sa.Credentials.from_service_account_file("engaged-tape-412316-0c6a1760feec.json")
+        project_id = "engaged-tape-412316"
+        self.client = bq.Client(credentials=self.credentials, project=project_id)
         pass
 
     def set_username(self, username: str):
@@ -29,19 +31,19 @@ class user():
         #Temp menu
         while (input("Are you logging in? (y/n): ") == "y"):
             #Get username & password
-            self.set_username(input("Please input username (max length 64): "))###########
+            self.set_username(input("Please input username: "))###########
             self.set_password(self.username, input("Please input password: "))
             self._admin = False
             #Check if username & password match in db. Adjust admin status to match
-            self.cursor.execute("""
-                           SELECT admin
-                           FROM Users
-                           WHERE username=? AND password=?;""",
-                        (self.username, self.password))
-            rows = self.cursor.fetchall()
-            if (rows):
+            rows = self.client.query("""
+                SELECT admin
+                FROM Energy_Data.Users
+                WHERE username="{}" AND password="{}";
+                """.format(self.username, self.password)).result()
+
+            if (rows.total_rows > 0):
                 print("Logging in...")
-                if (rows[0][0]=="TRUE"):
+                if (next(rows)[0]):
                     print("Logging in as admin.")
                     self._admin = True
                 return True
@@ -50,36 +52,41 @@ class user():
         print("Ending program.")
         return False
 
+    def logout(self, settings):
+        #Upload info to database
+        self.save_settings(settings=settings)
+        self.username = None
+        self.password = None
+        self._admin = False
+        pass
+
     def set_admin(self, username: str, is_admin: bool):###
         if (self._admin):
             #Check if user exists
-            self.cursor.execute("""
-            SELECT admin
-            FROM Users
-            WHERE username=?;
-            """, (username,))
-            rows = self.cursor.fetchall()
+            rows = self.client.query("""
+                SELECT admin
+                FROM Energy_Data.Users
+                WHERE username="{}";
+                """.format(username)).result()
             #Set admin privliges
-            if (rows):
-                self.cursor.execute("""
-                UPDATE Users
-                SET admin=?
-                WHERE username=?;
-                """, (is_admin, username))
-                self.db.commit()
+            if (rows.total_rows > 0):
+                self.client.query("""
+                    UPDATE Energy_Data.Users
+                    SET admin={}
+                    WHERE username="{}";
+                    """.format(is_admin, username)).result()
         return
 
     def insert_user(self, new_username: str, new_password: str, is_admin: bool):
-        try:
-            if (is_admin):
-                self.cursor.execute("INSERT INTO Users (username, password, admin) VALUES (?,?,?);",
-                            (new_username, self.password_hash(new_username+new_password), "TRUE"))
+        check = self.client.query("""SELECT username FROM Energy_Data.Users WHERE username="{}";""".format(new_username)).result()
+        if check.total_rows == 0:
+            if (is_admin and self._admin):
+                self.client.query("""INSERT INTO Energy_Data.Users (username, password, admin) VALUES ("{}","{}",{});""".format(new_username, self.password_hash(new_username+new_password), True)).result()
             else:
-                self.cursor.execute("INSERT INTO Users (username, password, admin) VALUES (?,?,?);",
-                            (new_username, self.password_hash(new_username+new_password), "FALSE"))
-        except sqlite3.IntegrityError:
+                self.client.query("""INSERT INTO Energy_Data.Users (username, password, admin) VALUES ("{}","{}",{});""".format(new_username, self.password_hash(new_username+new_password), False)).result()
+        else:
             print("ERROR: UNIQUE constraint failed. Try a different username.")
-        self.db.commit()
+        
 
     def make_user(self):
         new_username: str = input("Please input username: ")
@@ -98,10 +105,12 @@ class user():
             print("You need admin status for that!")
         else:
             username = input("Please input the username of the account to delete: ")
-            self.cursor.execute("""
-            DELETE FROM Users
-            WHERE username=?;""",
-            (username,))
+            self.client.query("""
+                DELETE FROM Energy_Data.Users
+                WHERE username="{}";""".format(username)).result()
+            self.client.query("""
+                DELETE FROM Energy_Data.User_Settings
+                WHERE user="{}";""".format(username)).result()
 
     def admin_menu(self) -> bool:
         if self._admin:
@@ -139,7 +148,31 @@ class user():
         return True
     
     def print_users(self):
-        self.cursor.execute("SELECT username FROM Users;")
-        records = self.cursor.fetchall()
+        records = self.client.query("SELECT username FROM Energy_Data.Users;").result()
         for r in records:
             print(r[0])
+    
+    def get_settings(self):
+        #Get settings if there are any
+        settings = self.client.query("""
+            SELECT start_date, end_date, locations, sources
+            FROM Energy_Data.User_Settings
+            WHERE user="{}";""".format(self.username)).result()
+        if settings.total_rows > 0:
+            s = next(settings)
+            return (
+                s.get("start_date"),
+                s.get("end_date"),
+                s.get("locations"),
+                s.get("sources")
+            )
+        else:
+            return None
+    
+    def save_settings(self, settings):
+        self.client.query("""
+            DELETE FROM Energy_Data.User_Settings
+            WHERE user="{}";""".format(self.username)).result()
+        self.client.query("""
+            INSERT INTO Energy_Data.User_Settings
+            VALUES ({}, {}, "{}", "{}", "{}");""".format(settings[0], settings[1], settings[2], settings[3], self.username)).result()
